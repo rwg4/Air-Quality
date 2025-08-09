@@ -50,7 +50,7 @@ BPM280_sensor = adafruit_bmp280.Adafruit_BMP280_I2C(i2c)
 BPM280_sensor.sea_level_pressure = 1013.25 # need a presure at sea level reading, which changes
 
 version = "0.0"
-debug = True
+debug = False
 neopixel_on = True
 function = "None"
 BoardName = "Air-Quality"
@@ -73,6 +73,8 @@ aqi_PM25 = -1
 aqi_PM25_category = "unknown"
 aqi_PM10 = -1
 aqi_PM10_category = "unknown"
+PM_dict = {}
+last_PM_dict = {}
 
 # Get WiFi details, ensure these are setup in settings.toml
 ssid = getenv("CIRCUITPY_WIFI_SSID")
@@ -248,10 +250,14 @@ def calculate_PM10_aqi(pm_sensor_reading):
         aqi_cat = None
     return round(aqi_val), aqi_cat
 
-def sample_aq_sensor():
+def sample_aq_sensor(debug):
+    global PM_dict
     """Samples PM2.5 sensor
     over a 2.3 second sample rate.
 
+    {'pm10 env': 2, 'pm100 env': 2, 'pm100 standard': 2, 'particles 03um': 519, 'pm25 standard': 2, 'particles 10um': 6,
+    'pm10 standard': 2, 'pm25 env': 2,
+    'particles 05um': 144, 'particles 25um': 0, 'particles 100um': 0, 'particles 50um': 0}
     """
     # initial timestamp
     time_start = time.monotonic()
@@ -259,23 +265,45 @@ def sample_aq_sensor():
     while time.monotonic() - time_start <= 2.3: #23.0:
         try:
             aqdata = pm25.read()
-            #PM_dict = {"PM25_value":0,"PM10_value":0,"PM_sample_count":0}
-            PM_dict["PM25_value"] += aqdata["pm25 env"]
-            PM_dict["PM10_value"] += aqdata["pm10 env"]
-            PM_dict["PM_sample_count"] += 1
-            #aq_PM25_reading += aqdata["pm25 env"]
-            #aq_PM10_reading += aqdata["pm10 env"]
-            #aq_samples += 1
+
+            if "pm100 env" not in PM_dict:
+                PM_dict = {"pm25 env":0,"pm10 env":0,"pm100 env":0,"PM_sample_count":0}
+                PM_dict.update({"particles 03um":0,"particles 10um":0,"particles 05um":0})
+                PM_dict.update({"particles 25um":0,"particles 100um":0,"particles 50um":0})
+
+            for i in PM_dict:
+                if i == "PM_sample_count":
+                    PM_dict[i] += 1
+                else:
+                    PM_dict[i] += aqdata[i]
         except RuntimeError:
             #print("Unable to read from sensor, retrying...")
             continue
         # pm sensor output rate of 1s
         time.sleep(1)
-    # average sample reading / # samples
-    #aq_PM25_reading = aq_PM25_reading / aq_samples
-    #aq_PM10_reading = aq_PM10_reading / aq_samples
-    #print(aq_samples)
-    #return aq_PM25_reading,aq_PM10_reading
+    if debug:
+        print(PM_dict)
+        print()
+        print("Concentration Units (standard)")
+        print("---------------------------------------")
+        print(
+            "PM 1.0: %d\tPM2.5: %d\tPM10: %d"
+            % (aqdata["pm10 standard"], aqdata["pm25 standard"], aqdata["pm100 standard"])
+        )
+        print("Concentration Units (environmental)")
+        print("---------------------------------------")
+        print(
+            "PM 1.0: %d\tPM2.5: %d\tPM10: %d"
+            % (aqdata["pm10 env"], aqdata["pm25 env"], aqdata["pm100 env"])
+        )
+        print("---------------------------------------")
+        print("Particles > 0.3um / 0.1L air:", aqdata["particles 03um"])
+        print("Particles > 0.5um / 0.1L air:", aqdata["particles 05um"])
+        print("Particles > 1.0um / 0.1L air:", aqdata["particles 10um"])
+        print("Particles > 2.5um / 0.1L air:", aqdata["particles 25um"])
+        print("Particles > 5.0um / 0.1L air:", aqdata["particles 50um"])
+        print("Particles > 10 um / 0.1L air:", aqdata["particles 100um"])
+        print("---------------------------------------")
 
 # Defines for the board's functions
 def setboardtime():
@@ -339,6 +367,9 @@ def handle_prior_error(report_boot: bool = False):
         function = "unknown"
 
 print("nvm contains [",nvm_read_data(verbose=False),"]")
+
+if debug:
+    sample_aq_sensor(debug)
 
 print("Connecting to WiFi: allocated: ",gc.mem_alloc()," free: ", gc.mem_free())
 
@@ -439,7 +470,6 @@ try:
     old_time = time.mktime((2020,8,8,21,0,0,0,-1,-1))
     last_msg_time = old_time
     remote_dict = {} # Initialize an empty dictionary
-    PM_dict = {"PM25_value":0,"PM10_value":0,"PM_sample_count":0}
 
     # Subscribe to all messages on the feeds of interest
     io_MQTT.subscribe("West-Beam-Remote")
@@ -469,18 +499,20 @@ try:
         else:
             report_status = False
 
-        sample_aq_sensor()
+        sample_aq_sensor(False)
         if PM_dict["PM_sample_count"] > 200:
-            aqi_PM25_reading = PM_dict["PM25_value"]/PM_dict["PM_sample_count"]
-            aqi_PM10_reading = PM_dict["PM10_value"]/PM_dict["PM_sample_count"]
+            aqi_PM25_reading = PM_dict["pm25 env"]/PM_dict["PM_sample_count"]
+            aqi_PM10_reading = PM_dict["pm10 env"]/PM_dict["PM_sample_count"]
             aqi_PM25, aqi_PM25_category = calculate_PM25_aqi(aqi_PM25_reading)
             aqi_PM10, aqi_PM10_category = calculate_PM10_aqi(aqi_PM10_reading)
-            #print(time_to_iso(current_time),PM_dict)
-            #print(time_to_iso(current_time),"PM2.5 average",aqi_PM25_reading,"calculated aqi",aqi_PM25,"category",aqi_PM25_category,
-            #   "; PM10 average",aqi_PM10_reading,"calculated aqi",aqi_PM10,"category",aqi_PM10_category)
-            PM_dict["PM25_value"] = 0
-            PM_dict["PM10_value"] = 0
-            PM_dict["PM_sample_count"] = 0
+            if debug:
+                #print(time_to_iso(current_time),PM_dict)
+                print(time_to_iso(current_time),"PM2.5 average",aqi_PM25_reading,"calculated aqi",aqi_PM25,"category",aqi_PM25_category,
+                "; PM10 average",aqi_PM10_reading,"calculated aqi",aqi_PM10,"category",aqi_PM10_category)
+            for i in PM_dict:
+                if i != "PM_sample_count":
+                    last_PM_dict[i] = PM_dict[i] / PM_dict["PM_sample_count"]
+            PM_dict = {}
 
             if aqi_PM25 > aqi_PM10:
                 aqi_worse = aqi_PM25
@@ -507,7 +539,8 @@ try:
                 io_MQTT.publish("AQI", aqi_worse)
                 function = "unknown"
 
-            print(time_to_iso(current_time),'Temperature: {} degrees F'.format((BPM280_sensor.temperature * 9 / 5) + 32),'Pressure: {}hPa'.format(BPM280_sensor.pressure))
+            print(time_to_iso(current_time),'AQI {}'.format(last_reported_aqi),
+                'Temperature: {} degrees F'.format((BPM280_sensor.temperature * 9 / 5) + 32),'Pressure: {}hPa'.format(BPM280_sensor.pressure))
 
         if report_status or last_status_time + 900 < current_time:
             CPU_temp = (microcontroller.cpu.temperature * 9 / 5) + 32
@@ -518,6 +551,7 @@ try:
             status_dict.update({"Temperature":(BPM280_sensor.temperature * 9 / 5) + 32,"Pressure (hPa)":BPM280_sensor.pressure})
             status_dict.update({"Version":version,"CPU Temp":CPU_temp})
             status_dict.update({"Last Message":time_to_iso(last_msg_time)})
+            status_dict.update(last_PM_dict)
             status_dict.update(remote_dict)
             dict_to_send = {"date":time_to_iso(current_time),"Board Name":BoardName,"Function":"Status",
                 "Exception":str(status_dict)}
@@ -529,16 +563,19 @@ try:
         time.sleep(0.5)
 
 except Exception as error:
-    time_str = time_to_iso(time.time())
-    dict_to_send = {"date":time_str,"Function":function,"Exception":str(error)}
-    nvm_string = nvm_read_data(verbose=False)
-    if debug == False and len(nvm_string) == 0:
-        print(time_str,"Saving to NVM: [",dict_to_send,"] debug",debug)
-        nvm_save_data(dict_to_send,test_run=debug,verbose=False)
-    else:
-        print(time_str,"Not saving to NVM: [",dict_to_send,"]")
-    time.sleep(60)
-    print("reset of some type")
-    #raise #This will cause the program to stop running
-    supervisor.reload() #This will cause the program to restart, but not to reset the H/W
-    #microcontroller.reset() #This will reset the H/W, including the REPL
+    try:
+        time_str = time_to_iso(time.time())
+        dict_to_send = {"date":time_str,"Function":function,"Exception":str(error),"mem alloc":gc.mem_alloc(),"mem free":gc.mem_free()}
+        nvm_string = nvm_read_data(verbose=False)
+        if debug == False and len(nvm_string) == 0:
+            print(time_str,"Saving to NVM: [",dict_to_send,"] debug",debug)
+            nvm_save_data(dict_to_send,test_run=debug,verbose=False)
+        else:
+            print(time_str,"Not saving to NVM: [",dict_to_send,"]")
+        time.sleep(60)
+        print("reset of some type")
+        #raise #This will cause the program to stop running
+        supervisor.reload() #This will cause the program to restart, but not to reset the H/W
+        #microcontroller.reset() #This will reset the H/W, including the REPL
+    except Exception as error:
+        microcontroller.reset() #This will reset the H/W, including the REPL
