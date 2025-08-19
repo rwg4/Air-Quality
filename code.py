@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: 2022 Liz Clark for Adafruit Industries
-#
-# SPDX-License-Identifier: MIT
-
 # Air Quality Sensor
 
 from os import getenv
@@ -9,11 +5,11 @@ import supervisor
 import microcontroller
 import rtc
 import time
-#import pwmio
 import ssl
 import board
 import gc
-#import adafruit_bh1750
+import digitalio
+import adafruit_bh1750
 import ipaddress
 import wifi
 import socketpool
@@ -27,7 +23,7 @@ from nvm_helper import nvm_save_data,nvm_read_data
 import busio
 from adafruit_pm25.i2c import PM25_I2C
 from adafruit_simplemath import map_range
-import adafruit_bmp280
+from adafruit_bme280 import basic as adafruit_bme280
 
 # Official AQI colors
 GREEN = (0, 255, 0)
@@ -40,16 +36,17 @@ BLACK = (0,0,0)
 
 # Define helpers
 r = rtc.RTC()
-#i2c = board.STEMMA_I2C()
 i2c = busio.I2C(board.SCL1, board.SDA1, frequency=100000)
-#BH1750_sensor = adafruit_bh1750.BH1750(i2c)
+BH1750_sensor = adafruit_bh1750.BH1750(i2c)
 reset_pin = False
 pm25 = PM25_I2C(i2c, reset_pin)
+relay = digitalio.DigitalInOut(board.D35)
+relay.direction = digitalio.Direction.OUTPUT
 
-BPM280_sensor = adafruit_bmp280.Adafruit_BMP280_I2C(i2c)
-BPM280_sensor.sea_level_pressure = 1013.25 # need a presure at sea level reading, which changes
+bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
+bme280.sea_level_pressure = 1013.4
 
-version = "0.0"
+version = "1.0"
 debug = False
 neopixel_on = True
 function = "None"
@@ -75,6 +72,8 @@ aqi_PM10 = -1
 aqi_PM10_category = "unknown"
 PM_dict = {}
 last_PM_dict = {}
+last_light_change_time = 0
+light_on = False
 
 # Get WiFi details, ensure these are setup in settings.toml
 ssid = getenv("CIRCUITPY_WIFI_SSID")
@@ -102,11 +101,11 @@ def connected(client):
     # This is a good place to subscribe to feed changes.  The client parameter
     # passed to this function is the Adafruit IO MQTT client so you can make
     # calls against it easily.
-    print("Connected to Adafruit IO!  Listening for DemoFeed changes...")
+    print(time_to_iso(time.time()),"Connected to Adafruit IO!  Listening for DemoFeed changes...")
 
 def subscribe(client, userdata, topic, granted_qos):
     # This method is called when the client subscribes to a new feed.
-    print(f"Subscribed to {topic} with QOS level {granted_qos}")
+    print(time_to_iso(time.time()),f"Subscribed to {topic} with QOS level {granted_qos}")
 
 def unsubscribe(client, userdata, topic, pid):
     # This method is called when the client unsubscribes from a feed.
@@ -114,11 +113,11 @@ def unsubscribe(client, userdata, topic, pid):
 
 def disconnected(client):
     # Disconnected function will be called when the client disconnects.
-    print("Disconnected from Adafruit IO!")
+    print(time_to_iso(time.time()),"Disconnected from Adafruit IO!")
 
 def publish(client, userdata, topic, pid):
     # This method is called when the client publishes data to a feed.
-    print(f"Published to {topic} with PID {pid}")
+    print(time_to_iso(time.time()),f"Published to {topic} with PID {pid}")
     if userdata is not None:
         print("Published User data: ", end="")
         print(userdata)
@@ -167,7 +166,7 @@ def on_West_Beam_Remote_msg(client, topic, message):
         else:
             remote_dict.update({"setup":True})
 
-    print("West-Beam-Remote: ", remote_dict,"Button",button)
+    print(time_to_iso(time.time()),"West-Beam-Remote: ", remote_dict,"Button",button)
 
 # Defines for AQI calculations
 def calculate_PM25_aqi(pm_sensor_reading):
@@ -366,6 +365,28 @@ def handle_prior_error(report_boot: bool = False):
         io.send_data("board-troubles", str(send_data))
         function = "unknown"
 
+def send_status():
+    global function
+    global last_status_time
+
+    CPU_temp = (microcontroller.cpu.temperature * 1.8) + 32
+    if report_status == False:
+        last_status_time = current_time
+    status_dict = {"PM2.5 AQI":aqi_PM25,"PM2.5 Category":aqi_PM25_category}
+    status_dict.update({"PM10 AQI":aqi_PM10,"PM10 Category":aqi_PM10_category})
+    status_dict.update({"Temperature":(bme280.temperature * 1.8) + 32,"Pressure (hPa)":bme280.pressure})
+    status_dict.update({"Humidity":bme280.humidity,"Ambient light":BH1750_sensor.lux})
+    status_dict.update({"Version":version,"CPU Temp":CPU_temp,"Memory allocated":gc.mem_alloc()})
+    status_dict.update({"Last Message":time_to_iso(last_msg_time),"Light On/Off":light_on})
+    status_dict.update(last_PM_dict)
+    status_dict.update(remote_dict)
+    dict_to_send = {"date":time_to_iso(current_time),"Board Name":BoardName,"Function":"Status",
+        "Exception":str(status_dict)}
+    print(time_to_iso(current_time),"Sending Dictionary",dict_to_send)
+    function = "publish status dictionary"
+    io_MQTT.publish("board-troubles", str(dict_to_send))
+    function = "unknown"
+
 print("nvm contains [",nvm_read_data(verbose=False),"]")
 
 if debug:
@@ -460,10 +481,6 @@ try:
     io_MQTT.connect()
 
     # Set up a message handler for the feeds of interest
-    #io_MQTT.add_feed_callback("Sauna-Temperature", on_Sauna_Temperature_msg)
-    #io_MQTT.add_feed_callback("West-Beam-brightness", on_West_Beam_brightness_msg)
-    #io_MQTT.add_feed_callback("West-Beam-Light-Strip", on_West_Beam_Light_Strip_msg)
-    #io_MQTT.add_feed_callback("West-Beam-Light-Switch", on_West_Beam_Light_Switch_msg)
     io_MQTT.add_feed_callback("West-Beam-Remote", on_West_Beam_Remote_msg)
 
     # Initialze the feed dictionaries
@@ -486,8 +503,6 @@ try:
         io_MQTT.loop() # Default timeout is 1 second
         function = "unknown"
 
-        current_time = time.time()
-
         # check for remote controls
         if "play" in remote_dict:
             play = remote_dict["play"]
@@ -499,7 +514,10 @@ try:
         else:
             report_status = False
 
-        sample_aq_sensor(False)
+        sample_aq_sensor(False) # this is at least 2.3 seconds
+
+        current_time = time.time()
+
         if PM_dict["PM_sample_count"] > 200:
             aqi_PM25_reading = PM_dict["pm25 env"]/PM_dict["PM_sample_count"]
             aqi_PM10_reading = PM_dict["pm10 env"]/PM_dict["PM_sample_count"]
@@ -516,8 +534,10 @@ try:
 
             if aqi_PM25 > aqi_PM10:
                 aqi_worse = aqi_PM25
+                aqi_category = aqi_PM25_category
             else:
-                aqi_worse = aqi_PM25
+                aqi_worse = aqi_PM10
+                aqi_category = aqi_PM10_category
             if aqi_worse < 51:
                 pixel.fill(GREEN)
             elif aqi_worse < 101:
@@ -539,26 +559,27 @@ try:
                 io_MQTT.publish("AQI", aqi_worse)
                 function = "unknown"
 
-            print(time_to_iso(current_time),'AQI {}'.format(last_reported_aqi),
-                'Temperature: {} degrees F'.format((BPM280_sensor.temperature * 9 / 5) + 32),'Pressure: {}hPa'.format(BPM280_sensor.pressure))
+            gc.collect()
+            print(time_to_iso(current_time),'AQI: {}'.format(aqi_worse),'Category: {}'.format(aqi_category),
+                'Temperature: {} degrees F'.format((bme280.temperature * 1.8) + 32),
+                'Humidity: {} %'.format(bme280.humidity),
+                'Pressure: {} hPa'.format(bme280.pressure),
+                'Memory allocated {}'.format(gc.mem_alloc()))
 
         if report_status or last_status_time + 900 < current_time:
-            CPU_temp = (microcontroller.cpu.temperature * 9 / 5) + 32
-            if report_status == False:
-                last_status_time = current_time
-            status_dict = {"PM2.5 AQI":aqi_PM25,"PM2.5 Category":aqi_PM25_category}
-            status_dict.update({"PM10 AQI":aqi_PM10,"PM10 Category":aqi_PM10_category})
-            status_dict.update({"Temperature":(BPM280_sensor.temperature * 9 / 5) + 32,"Pressure (hPa)":BPM280_sensor.pressure})
-            status_dict.update({"Version":version,"CPU Temp":CPU_temp})
-            status_dict.update({"Last Message":time_to_iso(last_msg_time)})
-            status_dict.update(last_PM_dict)
-            status_dict.update(remote_dict)
-            dict_to_send = {"date":time_to_iso(current_time),"Board Name":BoardName,"Function":"Status",
-                "Exception":str(status_dict)}
-            print(time_to_iso(current_time),"Sending Dictionary",dict_to_send)
-            function = "publish status dictionary"
-            io_MQTT.publish("board-troubles", str(dict_to_send))
-            function = "unknown"
+            send_status()
+            gc.collect()
+
+        # Control Light String
+        if last_light_change_time + 300 < current_time:
+            last_light_change_time = current_time
+            if BH1750_sensor.lux < 30:
+                light_on = True
+                relay.value = True
+            else:
+                light_on = False
+                relay.value = False
+            print(time_to_iso(current_time),"Light string:",light_on)
 
         time.sleep(0.5)
 
