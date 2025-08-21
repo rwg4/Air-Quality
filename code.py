@@ -46,7 +46,7 @@ relay.direction = digitalio.Direction.OUTPUT
 bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
 bme280.sea_level_pressure = 1013.4
 
-version = "1.0"
+version = "1.1"
 debug = False
 neopixel_on = True
 function = "None"
@@ -66,6 +66,8 @@ current_color = "#000000"
 current_white = "OFF"
 current_brightness = 0
 last_reported_aqi = 0
+last_reported_temperature = -100
+last_reported_humidity = -100
 aqi_PM25 = -1
 aqi_PM25_category = "unknown"
 aqi_PM10 = -1
@@ -74,6 +76,14 @@ PM_dict = {}
 last_PM_dict = {}
 last_light_change_time = 0
 light_on = False
+
+# Define a state machine (day_state) for the interesting times of day
+Neutral = 0
+evening_waiting = 1
+evening_triggered = 2
+morning_triggered = 3
+morning_done = 4
+day_state = Neutral
 
 # Get WiFi details, ensure these are setup in settings.toml
 ssid = getenv("CIRCUITPY_WIFI_SSID")
@@ -94,6 +104,12 @@ if None in [ssid, password, aio_username, aio_key]:
         "'CIRCUITPY_WIFI_SSID', 'CIRCUITPY_WIFI_PASSWORD', "
         "'ADAFRUIT_AIO_USERNAME' and 'ADAFRUIT_AIO_KEY' at a minimum."
     )
+
+def time_to_iso(unix_time):
+    time_struct = time.localtime(unix_time)
+    time_str = "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d%s" %(int(time_struct.tm_year),int(time_struct.tm_mon),
+        int(time_struct.tm_mday),int(time_struct.tm_hour),int(time_struct.tm_min),int(time_struct.tm_sec),UTC_offset)
+    return time_str
 
 # Define callback functions which will be called when certain MQTT events happen.
 def connected(client):
@@ -340,12 +356,6 @@ def iso_to_unix(iso_time):
 
     return time.mktime(time_struct)
 
-def time_to_iso(unix_time):
-    time_struct = time.localtime(unix_time)
-    time_str = "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d%s" %(int(time_struct.tm_year),int(time_struct.tm_mon),
-        int(time_struct.tm_mday),int(time_struct.tm_hour),int(time_struct.tm_min),int(time_struct.tm_sec),UTC_offset)
-    return time_str
-
 def handle_prior_error(report_boot: bool = False):
     global function
     global force_error
@@ -503,6 +513,31 @@ try:
         io_MQTT.loop() # Default timeout is 1 second
         function = "unknown"
 
+        time_struct = time.localtime()
+
+        # Set state machine based on current time, and control Light String
+        if time_struct.tm_hour > 15 and day_state == Neutral:
+            day_state = evening_waiting
+        elif time_struct.tm_hour > 3 and time_struct.tm_hour < 9 and day_state == Neutral:
+            day_state = morning_triggered
+            light_on = True
+            relay.value = True
+        elif time_struct.tm_hour <= 3 or (time_struct.tm_hour >= 9 and time_struct.tm_hour <= 15):
+            day_state = Neutral
+            if light_on:
+                light_on = False
+                relay.value = False
+        else:
+            ambient_light_lux = BH1750_sensor.lux
+            if ambient_light_lux < 15 and day_state == evening_waiting:
+                day_state = evening_triggered
+                light_on = True
+                relay.value = True
+            elif ambient_light_lux >= 15 and day_state == morning_triggered:
+                day_state = morning_done
+                light_on = False
+                relay.value = False
+
         # check for remote controls
         if "play" in remote_dict:
             play = remote_dict["play"]
@@ -553,12 +588,23 @@ try:
             pixel.show()
 
             if last_reported_aqi != aqi_worse:
-                last_reported_aqi = aqi_worse
+                #last_reported_aqi = aqi_worse
                 print(time_to_iso(current_time),"AQI",aqi_worse)
                 function = "publish AQI"
                 io_MQTT.publish("AQI", aqi_worse)
                 function = "unknown"
-
+            Temp = (bme280.temperature * 1.8) + 32
+            if last_reported_temperature != Temp:
+                #last_reported_temperature = Temp
+                function = "publish Temperature"
+                io_MQTT.publish("Outdoor-Temperature", Temp)
+                function = "unknown"
+            Humidity = bme280.humidity
+            if last_reported_humidity != Humidity:
+                #last_reported_humidity = Humidity
+                function = "publish Humidity"
+                io_MQTT.publish("Outdoor-Humidity", Humidity)
+                function = "unknown"
             gc.collect()
             print(time_to_iso(current_time),'AQI: {}'.format(aqi_worse),'Category: {}'.format(aqi_category),
                 'Temperature: {} degrees F'.format((bme280.temperature * 1.8) + 32),
@@ -569,17 +615,6 @@ try:
         if report_status or last_status_time + 900 < current_time:
             send_status()
             gc.collect()
-
-        # Control Light String
-        if last_light_change_time + 300 < current_time:
-            last_light_change_time = current_time
-            if BH1750_sensor.lux < 30:
-                light_on = True
-                relay.value = True
-            else:
-                light_on = False
-                relay.value = False
-            print(time_to_iso(current_time),"Light string:",light_on)
 
         time.sleep(0.5)
 
