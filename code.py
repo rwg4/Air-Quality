@@ -46,7 +46,7 @@ relay.direction = digitalio.Direction.OUTPUT
 bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c)
 bme280.sea_level_pressure = 1013.4
 
-version = "1.1"
+version = "1.2"
 debug = False
 neopixel_on = True
 function = "None"
@@ -65,7 +65,7 @@ last_temperature = 0
 current_color = "#000000"
 current_white = "OFF"
 current_brightness = 0
-last_reported_aqi = 0
+last_reported_aqi = -1
 last_reported_temperature = -100
 last_reported_humidity = -100
 aqi_PM25 = -1
@@ -76,6 +76,9 @@ PM_dict = {}
 last_PM_dict = {}
 last_light_change_time = 0
 light_on = False
+light_enabled = False
+boot_time = time.time()
+daily_time_check = False
 
 # Define a state machine (day_state) for the interesting times of day
 Neutral = 0
@@ -147,6 +150,7 @@ def on_message(client, feed_id, payload):
 def on_West_Beam_Remote_msg(client, topic, message):
     global remote_dict
     global last_msg_time
+    global light_enabled
     last_msg_time = time.time()
 
     if "press-count" in remote_dict:
@@ -181,6 +185,15 @@ def on_West_Beam_Remote_msg(client, topic, message):
             remote_dict["setup"] = True
         else:
             remote_dict.update({"setup":True})
+    elif button == 26: # Number 9
+        if "Number9-light_enabled" in remote_dict:
+            if remote_dict["Number9-light_enabled"]:
+                remote_dict["Number9-light_enabled"] = False
+            else:
+                remote_dict["Number9-light_enabled"] = True
+        else:
+            remote_dict.update({"Number9-light_enabled":False})
+        light_enabled = remote_dict["Number9-light_enabled"]
 
     print(time_to_iso(time.time()),"West-Beam-Remote: ", remote_dict,"Button",button)
 
@@ -325,12 +338,15 @@ def setboardtime():
     # calculate time offset from UTC and set RC to local time
     global function
     global UTC_offset
+    global boot_time
     function = "receive_time"
     web_time_struct = io.receive_time("UTC")
     web_local_time_struct = io.receive_time()
     utc_time = time.mktime(web_time_struct)
     local_time = time.mktime(web_local_time_struct)
     function = "unknown"
+    board_time = time.time()
+    r.datetime = web_local_time_struct
     print(utc_time,local_time,(local_time - utc_time)/3600,round((local_time - utc_time)/3600,1))
 
     hour_offset = round((local_time - utc_time)/3600,1)
@@ -342,7 +358,18 @@ def setboardtime():
     UTC_offset = "%s%.2d" %(offset_sign,hour_offset)
 
     print("hours from UTC: ",UTC_offset)
-    r.datetime = web_local_time_struct
+
+    # on a power up, boot_time will be in the year 2000, so reset it if we have a proper time now
+    if abs(boot_time - time.time()) > 10000000:
+        boot_time = time.time()
+    elif board_time != local_time:
+        print("Clock drift detected,",local_time-board_time,"Seconds")
+        time_str = time_to_iso(time.time())
+        dict_to_send = {"date":time_str,"Board Name":BoardName,"Event":"Clock Drift","Drift":local_time-board_time}
+        print(time_str,"Sending Dictionary",dict_to_send)
+        function = "publish Clock Drift dictionary"
+        io_MQTT.publish("board-troubles", str(dict_to_send))
+        function = "unknown"
 
 def iso_to_unix(iso_time):
     #convert iso format (2025-07-23T18:03:41Z) to a unix time
@@ -359,18 +386,20 @@ def iso_to_unix(iso_time):
 def handle_prior_error(report_boot: bool = False):
     global function
     global force_error
+    send_data = {"Board Name":BoardName,"Event":"Boot","Reset Reason":str(microcontroller.cpu.reset_reason)}
+    send_data.update({"Serial Connected":supervisor.runtime.serial_connected,"run reason":str(supervisor.runtime.run_reason)})
     nvm_string = nvm_read_data(verbose=False)
     if len(nvm_string):
         #report then clear NVM contents
-        function = "sending board-troubles"
-        nvm_string.update({"Board Name":BoardName})
+        function = "sending board-troubles-nvm"
+        nvm_string.update(send_data)
         io.send_data("board-troubles", str(nvm_string))
         function = "unknown"
         print("Clearing NVM")
         nvm_save_data("",test_run=False,verbose=False)
         force_error = False
     elif report_boot:
-        send_data = ({"date":time_to_iso(time.time()),"Board Name":BoardName,"Exception":"booted"})
+        send_data.update({"date":time_to_iso(time.time())})
         function = "sending board-troubles"
         io.send_data("board-troubles", str(send_data))
         function = "unknown"
@@ -388,10 +417,11 @@ def send_status():
     status_dict.update({"Humidity":bme280.humidity,"Ambient light":BH1750_sensor.lux})
     status_dict.update({"Version":version,"CPU Temp":CPU_temp,"Memory allocated":gc.mem_alloc()})
     status_dict.update({"Last Message":time_to_iso(last_msg_time),"Light On/Off":light_on})
+    status_dict.update({"light enabled":light_enabled,"boot time":time_to_iso(boot_time)})
     status_dict.update(last_PM_dict)
     status_dict.update(remote_dict)
-    dict_to_send = {"date":time_to_iso(current_time),"Board Name":BoardName,"Function":"Status",
-        "Exception":str(status_dict)}
+    dict_to_send = {"date":time_to_iso(current_time),"Board Name":BoardName,"Event":"Status",
+        "Status":str(status_dict)}
     print(time_to_iso(current_time),"Sending Dictionary",dict_to_send)
     function = "publish status dictionary"
     io_MQTT.publish("board-troubles", str(dict_to_send))
@@ -446,17 +476,6 @@ try:
     #print(user_info)
     function = "unknown"
 
-    print()
-    print("start time: ",time.time()," timestruct: ",time.localtime())
-
-    setboardtime()
-
-    last_status_time = time.time()
-
-    print("web based time: ",time.time()," timestruct: ",r.datetime," allocated: ",gc.mem_alloc()," free: ", gc.mem_free())
-
-    print(time.time(),time_to_iso(time.time()),iso_to_unix(time_to_iso(time.time())))
-
     # Create a socket pool and ssl_context
     pool2 = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
     ssl_context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
@@ -490,6 +509,17 @@ try:
     print("Connecting to Adafruit IO...")
     io_MQTT.connect()
 
+    print()
+    print("start time: ",time.time()," timestruct: ",time.localtime())
+
+    setboardtime()
+    
+    last_status_time = time.time()
+
+    print("web based time: ",time.time()," timestruct: ",r.datetime," allocated: ",gc.mem_alloc()," free: ", gc.mem_free())
+
+    print(time.time(),time_to_iso(time.time()),iso_to_unix(time_to_iso(time.time())))
+
     # Set up a message handler for the feeds of interest
     io_MQTT.add_feed_callback("West-Beam-Remote", on_West_Beam_Remote_msg)
 
@@ -519,9 +549,10 @@ try:
         if time_struct.tm_hour > 15 and day_state == Neutral:
             day_state = evening_waiting
         elif time_struct.tm_hour > 3 and time_struct.tm_hour < 9 and day_state == Neutral:
-            day_state = morning_triggered
-            light_on = True
-            relay.value = True
+            if light_enabled:
+                day_state = morning_triggered
+                light_on = True
+                relay.value = True
         elif time_struct.tm_hour <= 3 or (time_struct.tm_hour >= 9 and time_struct.tm_hour <= 15):
             day_state = Neutral
             if light_on:
@@ -530,14 +561,26 @@ try:
         else:
             ambient_light_lux = BH1750_sensor.lux
             if ambient_light_lux < 15 and day_state == evening_waiting:
-                day_state = evening_triggered
-                light_on = True
-                relay.value = True
+                if light_enabled:
+                    day_state = evening_triggered
+                    light_on = True
+                    relay.value = True
             elif ambient_light_lux >= 15 and day_state == morning_triggered:
                 day_state = morning_done
                 light_on = False
                 relay.value = False
-
+            elif light_enabled == False and light_on: # This allows button 9 to turn off the lights
+                light_on = False
+                relay.value = False
+                
+        # Reset board time, to keep it in sync and deal with DST/Standard time changes
+        if time_struct.tm_hour == 2 and time_struct.tm_min >= 15:
+            if daily_time_check == False:
+                setboardtime()
+                daily_time_check = True
+        elif daily_time_check:
+            daily_time_check = False
+            
         # check for remote controls
         if "play" in remote_dict:
             play = remote_dict["play"]
